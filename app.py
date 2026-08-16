@@ -61,10 +61,10 @@ async def send_request(encrypted_uid, token, url):
             'ReleaseVersion': "OB54"
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers) as response:
+            async with session.post(url, data=edata, headers=headers, ssl=False) as response:
                 if response.status != 200:
                     app.logger.error(f"Request failed with status code: {response.status}")
-                    return response.status
+                    return None
                 return await response.text()
     except Exception as e:
         app.logger.error(f"Exception in send_request: {e}")
@@ -86,11 +86,18 @@ async def send_multiple_requests(uid, server_name, url):
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
-        for i in range(100):
+        
+        # AMBIL SEMUA TOKEN, bukan cuma 1
+        for i in range(min(100, len(tokens))):  # Maks 100 request
             token = tokens[i % len(tokens)]["token"]
             tasks.append(send_request(encrypted_uid, token, url))
+        
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
+        
+        # HITUNG YANG SUKSES
+        success_count = sum(1 for r in results if r is not None and not isinstance(r, Exception))
+        app.logger.info(f"Successful requests: {success_count}/{len(tasks)}")
+        return success_count
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
@@ -133,8 +140,7 @@ def make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB54"
         }
         response = requests.post(url, data=edata, headers=headers, verify=False)
-        hex_data = response.content.hex()
-        binary = bytes.fromhex(hex_data)
+        binary = response.content
         decode = decode_protobuf(binary)
         if decode is None:
             app.logger.error("Protobuf decoding returned None.")
@@ -165,7 +171,6 @@ def index():
         "example": "/like?uid=123456789 or /like?uid=123456789&server_name=bd"
 })
 
-
 @app.route('/like', methods=['GET'])
 def handle_requests():
     uid = request.args.get("uid")
@@ -178,7 +183,6 @@ def handle_requests():
             return jsonify({"error": "Failed to load tokens."}), 500
         token = tokens[0]['token']
         
-        # Extract server_name (lock_region) from token if not provided
         server_name = request.args.get("server_name", "").upper()
         if not server_name:
             try:
@@ -214,9 +218,13 @@ def handle_requests():
         else:
             url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
-        # Send like requests
-        requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url))
-        app.logger.info(f"Requests sent: {requests_sent}")
+        # Send like requests (TAMBAHIN DELAY biar ga kena rate limit)
+        import time
+        success_count = asyncio.run(send_multiple_requests(uid, server_name, url))
+        app.logger.info(f"Successful like requests: {success_count}")
+
+        # WAIT sebentar biar server update
+        time.sleep(2)
 
         # Get after likes count
         after = make_request(encrypted_uid, server_name, token)
@@ -231,6 +239,19 @@ def handle_requests():
         
         like_given = after_like - before_like
         
+        # KALO MASIH 0, TAMBAHIN REQUEST ULANG
+        if like_given == 0 and success_count > 0:
+            app.logger.warning("Like still 0, trying one more time...")
+            time.sleep(1)
+            asyncio.run(send_multiple_requests(uid, server_name, url))
+            time.sleep(2)
+            
+            after_retry = make_request(encrypted_uid, server_name, token)
+            if after_retry:
+                data_retry = json.loads(MessageToJson(after_retry))
+                after_like = int(data_retry.get('AccountInfo', {}).get('Likes', 0) or 0)
+                like_given = after_like - before_like
+        
         return jsonify({
             "credit": "https://t.me/paglu_dev",
             "LikesGivenByAPI": like_given,
@@ -239,7 +260,8 @@ def handle_requests():
             "PlayerNickname": player_name,
             "Region": server_name,
             "UID": player_uid,
-            "status": 1 if like_given > 0 else 2
+            "status": 1 if like_given > 0 else 2,
+            "successful_requests": success_count
         })
     except Exception as e:
         app.logger.error(f"Error processing request: {e}")
